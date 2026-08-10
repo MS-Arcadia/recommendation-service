@@ -1,0 +1,128 @@
+# Recommendation service pipeline.
+#
+# Lint and typecheck, then build the image and boot it with no database to prove the readiness
+# probe actually reports DOWN instead of lying.
+#
+# This service's behaviour is covered by the platform's end-to-end suite
+# (infra/test/e2e/test_15_recommendations.py) rather than in-repo tests, because everything it
+# knows arrives on three topics owned by three other services — see the README. That job needs
+# Postgres, Kafka and four other services running together, which does not belong in any one
+# service's repository.
+
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+env:
+  PYTHON_VERSION: "3.14"
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v3
+        with:
+          version: "0.9.x"
+          python-version: ${{ env.PYTHON_VERSION }}
+
+      - name: Install
+        run: uv sync --frozen
+
+      - name: Lint
+        run: |
+          uv run ruff check --output-format=github .
+          uv run ruff format --check .
+
+      - name: Typecheck
+        run: uv run mypy
+
+  image:
+    runs-on: ubuntu-latest
+    needs: check
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: docker/setup-buildx-action@v3
+
+      - name: Log in to the registry
+        if: github.event_name != 'pull_request'
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ghcr.io/${{ github.repository }}
+          tags: |
+            type=ref,event=branch
+            type=semver,pattern={{version}}
+            type=sha,format=short
+            type=raw,value=latest,enable={{is_default_branch}}
+
+      - name: Build
+        # load=true so the smoke test can run the image locally. push and load cannot share one
+        # buildx export, so registry publish is a separate step after smoke.
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          push: false
+          load: true
+          tags: |
+            arcadia/recommendation-service:${{ github.sha }}
+            ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          build-args: VERSION=${{ github.sha }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: The image starts and reports unready without a database
+        # A container that cannot reach Postgres must report DOWN rather than UP. This is the
+        # check that would have caught a readiness probe wired to nothing.
+        run: |
+          docker run -d --name recommendation \
+            -e APP_ENV=local \
+            -e PERSISTENCE_BACKEND=postgres \
+            -e DATABASE_URL=postgresql+asyncpg://nobody:nobody@127.0.0.1:5432/nothing \
+            -e MESSAGING_BACKEND=inproc \
+            -e CACHE_BACKEND=memory \
+            -e IDENTITY_BACKEND=fake \
+            -e RUN_MIGRATIONS=false \
+            -e GENERATION_ENABLED=false \
+            -p 8093:8093 \
+            arcadia/recommendation-service:${{ github.sha }}
+          for i in $(seq 1 30); do
+            if curl -sf localhost:8093/livez >/dev/null; then break; fi
+            sleep 1
+          done
+          curl -sf localhost:8093/livez | grep -q UP
+          echo "liveness is up"
+          status=$(curl -s -o /dev/null -w '%{http_code}' localhost:8093/readyz)
+          [ "$status" = "503" ] || { echo "expected 503 from /readyz, got $status"; docker logs recommendation; exit 1; }
+          echo "readiness correctly reports 503 with no database"
+          docker rm -f recommendation
+
+      - name: Push to the registry
+        # A pull request gets its image built and smoked — proving the Dockerfile still works —
+        # but never pushed.
+        if: github.event_name != 'pull_request'
+        run: |
+          echo "${{ steps.meta.outputs.tags }}" | while IFS= read -r tag; do
+            [ -n "$tag" ] || continue
+            docker push "$tag"
+          done
