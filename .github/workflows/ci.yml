@@ -139,6 +139,7 @@ jobs:
           mkdir -p ~/.kube
           printf '%s' "${{ secrets.ARCADIA_KUBECONFIG }}" > ~/.kube/config
           chmod 600 ~/.kube/config
+          echo "kubeconfig byte count: $(wc -c < ~/.kube/config)"
 
       # `set image` wouldn't trigger a rollout here: the tag is always :latest, so
       # the pod template's image string never changes. `rollout restart` forces new
