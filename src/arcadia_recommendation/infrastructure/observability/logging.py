@@ -25,13 +25,19 @@ def _add_service(service_name: str) -> Any:
     return processor
 
 
+# snake_case throughout, matching the twelve other services on the platform.
+# These two were the only ones emitting camelCase, which mattered because
+# correlation_id is the field a cross-service query filters on: a LogQL
+# `| json | correlation_id="..."` silently returned nothing for them. It also
+# made a single line internally inconsistent, since the request middleware
+# already passed actor_id in snake_case alongside the processor's actorId.
 def _add_correlation(_logger: Any, _name: str, event_dict: EventDict) -> EventDict:
     correlation_id = current_correlation_id()
     if correlation_id is not None:
-        event_dict["correlationId"] = correlation_id
+        event_dict["correlation_id"] = correlation_id
     actor_id = current_actor_id()
     if actor_id is not None:
-        event_dict["actorId"] = actor_id
+        event_dict["actor_id"] = actor_id
     return event_dict
 
 
@@ -39,8 +45,8 @@ def _add_trace_context(_logger: Any, _name: str, event_dict: EventDict) -> Event
     span = trace.get_current_span()
     context = span.get_span_context()
     if context.is_valid:
-        event_dict["traceId"] = format(context.trace_id, "032x")
-        event_dict["spanId"] = format(context.span_id, "016x")
+        event_dict["trace_id"] = format(context.trace_id, "032x")
+        event_dict["span_id"] = format(context.span_id, "016x")
     return event_dict
 
 

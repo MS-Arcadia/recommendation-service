@@ -13,7 +13,7 @@ _TRACER_NAME = "arcadia.recommendation"
 
 
 def configure_tracing(settings: Settings) -> None:
-    """A provider is always installed so every log line carries a traceId, but nothing is exported unless
+    """A provider is always installed so every log line carries a trace_id, but nothing is exported unless
     asked for: OTLP when an endpoint is configured, console when OTEL_CONSOLE_EXPORT is set. Dumping spans to
     stdout by default would bury the output of a local run and of the test suite.
     TODO(integration): OBSERVABILITY — point OTLP at the cluster collector in the observability namespace
