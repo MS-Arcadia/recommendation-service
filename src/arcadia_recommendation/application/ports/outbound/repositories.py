@@ -22,6 +22,10 @@ class GameProfileRepository(Protocol):
 
     async def count_recommendable(self) -> int: ...
 
+    async def needing_embedding(self, limit: int) -> Sequence[GameProfile]: ...
+
+    async def nearest_to(self, game: GameProfile, limit: int) -> Sequence[GameProfile]: ...
+
 
 class UserPreferenceRepository(Protocol):
     """One row per user this service has ever heard about."""

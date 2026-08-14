@@ -3,13 +3,17 @@
 Personalised game recommendations for the [Arcadia](../PHASE01/README.md) platform.
 Requirements **§3.1**, the competitive differentiator.
 
-Python 3.14 · FastAPI · PostgreSQL · Kafka · Redis · port **8093**
+Python 3.14 · FastAPI · PostgreSQL + pgvector · Kafka · Redis · port **8093**
 
 ```bash
 make install
 make run                 # http://localhost:8093/v1/docs
 make test                # ruff, then mypy --strict
 ```
+
+Ranking runs over genre/tag features by default and over semantic embeddings when
+`SCORING_BACKEND=dense`; both are ingested either way, so the switch is a restart. Neither needs an
+API key to start — see [How the ranking works](#how-the-ranking-works).
 
 ---
 
@@ -43,14 +47,35 @@ review-events ──┘                         │
 
 ## How the ranking works
 
-### Games and users live in the same space
+### Games and users live in the same space — one of two
 
-A game becomes a sparse vector over named features built from Catalog's genres and tags —
-`genre:racing`, `tag:co-op`. Namespaced by kind, so a genre Catalog validates is not outvoted by
-a tag nobody curates.
+Every game gets two content vectors, and `SCORING_BACKEND` picks which one the content half ranks
+in. Both are always maintained, so switching is a restart rather than a migration or a re-ingest —
+the sweep embeds unembedded games whichever space is configured, which means a catalogue can be
+warmed on `sparse` and the switch to `dense` costs nothing. With the default in-process embedder
+that is free; against a paid endpoint it is a bill for vectors nobody is reading yet, so set
+`EMBEDDING_BACKEND=hashing` if you are staying on `sparse`.
 
-A user's **taste** is the scaled sum of the games they acted on. That is the whole of "learning"
-here:
+| | `SCORING_BACKEND=sparse` (default) | `SCORING_BACKEND=dense` |
+|---|---|---|
+| The vector | named features from Catalog's genres and tags — `genre:racing`, `tag:co-op`, namespaced by kind so a genre Catalog validates is not outvoted by a tag nobody curates | a semantic embedding of the title, labels and description, from an embedding model |
+| Finds | games sharing labels | games that *are* alike, however they were labelled |
+| Explains itself | yes — `reasons` is the shared features | no — see below |
+| Needs | nothing | an embedding endpoint, and pgvector |
+
+The dense space exists because the sparse one has a specific, common failure: two racing games
+tagged by different developers — `racing`/`arcade` against `motorsport`/`simulation` — share no
+feature at all and score exactly **zero** against each other. Requirements §3.1 names both
+approaches ("embedding/TF-IDF"), and architecture table row 12 and ER د-۱۲ both specify a `vector`
+column; the sparse implementation was the narrower half of what was designed.
+
+What it costs is the explanation. Named dimensions can be intersected, which is where
+`"because you like racing games"` came from. Anonymous ones cannot: a coordinate is not a reason.
+So a dense deployment produces empty `reasons` unless `EXPLANATION_BACKEND` is set, and that is
+deliberately visible rather than papered over with a generated-sounding sentence.
+
+A user's **taste** is the scaled sum of the games they acted on, in whichever space. That is the
+whole of "learning" here:
 
 | Signal | Weight | |
 |---|---|---|
@@ -61,12 +86,23 @@ here:
 A **gift credits the recipient, not the payer.** Otherwise the platform learns that you love
 whatever your friends play, and the recipient's own library stays recommendable back to them.
 
+### Why the signals are remembered, not just summed
+
+A taste vector is a running sum, and a sum cannot be taken apart: once a game is folded in, nothing
+recovers which game contributed what. That is fine with one space and fatal with two, because the
+two arrive independently — an embedding is a call to a third party, and `PurchaseCompleted` is not
+going to wait for it. A game bought before it was embedded contributes nothing to the dense vector.
+
+So each profile also keeps the last 200 actions as `(game, weight)` — the `interaction_history` of
+ER د-۱۲ — and the sweep rebuilds the dense vector from them each pass. A late embedding then costs
+a recomputation rather than a signal lost for good.
+
 ### Two scorers, blended 65 / 35
 
-**Content** — cosine between the user's taste and each game's vector. Cosine rather than a dot
-product because magnitudes mean nothing comparable: someone with forty games has a longer vector
-than someone with two, and without normalising, every candidate scores higher for the first user
-purely on volume.
+**Content** — cosine between the user's taste and each game's vector, in whichever space is
+configured. Cosine rather than a dot product because magnitudes mean nothing comparable: someone
+with forty games has a longer vector than someone with two, and without normalising, every
+candidate scores higher for the first user purely on volume.
 
 **Collaborative** — item-item co-purchase, as one Postgres self-join: *everyone who owns what you
 own, and what else they own*. Counted by **distinct neighbour**, not by row — otherwise the
@@ -127,6 +163,12 @@ yet describe has nothing to contribute to a taste vector.
 Those purchases are recorded as ownership with `counted = false` — so the collaborative half is
 never left with a hole — and `GamePublished` credits them when the description turns up.
 
+The dense space has the **same problem one layer down**: a game can be published and bought before
+its embedding has been computed, because computing it is an HTTP call the ingest path deliberately
+does not wait for. `interaction_history` is that fix, and unlike `counted` it needs no flag —
+the vector is rebuilt from the remembered actions on every sweep, so a late embedding repairs
+itself.
+
 This was not theoretical. Booting against the platform's real 18 hours of event history produced
 19 ownerships and **2** preference profiles. With backfill: 16 ownerships, **14** profiles, zero
 uncounted. Without it the content half would have silently done almost nothing on every fresh
@@ -155,8 +197,13 @@ Personalised reads are authenticated because the list is derived from what someb
 makes it a statement about a person rather than about the catalogue.
 
 Every response carries `source` — `CONTENT`, `COLLAB`, `HYBRID` or `FALLBACK` — and each item
-carries `reasons`, the shared features behind it. The score is a float nobody can interpret;
-"because you like racing games" is the only part of the answer a user can check.
+carries `reasons`. The score is a float nobody can interpret; "because you like racing games" is
+the only part of the answer a user can check.
+
+Where `reasons` comes from depends on configuration: shared features on the sparse path, an
+explanation model on the dense one, and **empty** on a dense deployment with
+`EXPLANATION_BACKEND=none` — which is the honest answer rather than a fabricated one. A client
+must already treat it as optional; that has not changed.
 
 ---
 
@@ -164,7 +211,10 @@ carries `reasons`, the shared features behind it. The score is a float nobody ca
 
 **Consumes** — `game-events` (`GamePublished`, `GameWithdrawn`), `purchase-events`
 (`PurchaseCompleted`), `review-events` (`ReviewPosted`). Each has an anti-corruption handler in
-`presentation/consumers/`; those services' payload shapes stop there.
+`presentation/consumers/`; those services' payload shapes stop there. `GamePublished`'s
+`description` is read as well as its genres and tags — it is the richest input the semantic space
+has, and the field most likely to be missing, so a game without one is embedded from its title and
+labels rather than skipped.
 
 **Produces** — `arcadia.reco.v1.RecommendationGenerated` on `reco-events`, consumed by Profile.
 The whole list travels in the event rather than a "come and fetch it" notification, so a
@@ -183,20 +233,50 @@ for ever, and the fallback ranking is built on that number.
 Clean Architecture, dependencies pointing inwards only.
 
 ```
-domain/          policy/scoring.py is the recommender; policy/embedding.py the vector space
+domain/          policy/scoring.py is the recommender; policy/embedding.py both vector spaces
 application/     use cases + ports; nothing here imports FastAPI or SQLAlchemy
-infrastructure/  Postgres, Kafka, Redis, the scheduler, the outbox
+infrastructure/  Postgres, Kafka, Redis, the scheduler, the outbox, the two providers
 presentation/    HTTP routers and the three Kafka consumers
 composition.py   the only module allowed to import infrastructure.persistence
 ```
 
-`PERSISTENCE_BACKEND`, `MESSAGING_BACKEND`, `CACHE_BACKEND` and `IDENTITY_BACKEND` each flip
-independently, so the service runs entirely in-process with no infrastructure at all. See
-`.env.example`.
+The embedding provider and the explanation model are reached through ports
+(`application/ports/outbound/enrichment.py`) with adapters in `infrastructure/adapters/`. That is
+§2.8's Anti-Corruption Layer applied to a third party this service chose rather than inherited: no
+provider's payload shape reaches past its adapter, and neither the domain nor the use cases know
+that HTTP is involved.
 
-The embedding is JSONB, not pgvector: that index earns its place for approximate
-nearest-neighbour search over thousands of dense dimensions, and this space is a few dozen named
-sparse ones scanned in full.
+`PERSISTENCE_BACKEND`, `MESSAGING_BACKEND`, `CACHE_BACKEND`, `IDENTITY_BACKEND`, `SCORING_BACKEND`,
+`EMBEDDING_BACKEND` and `EXPLANATION_BACKEND` each flip independently, so the service still runs
+entirely in-process with no infrastructure and no API keys at all. See `.env.example`.
+
+**The sparse embedding is JSONB; the dense one is a pgvector `vector` column.** Both were built and
+measured, because the sparse space's own argument — a few dozen named dimensions, scanned in full,
+no index worth having — looked like it should carry over.
+
+It does not. Answering one `/v1/games/{id}/similar` over 500 games at 1024 dimensions, JSONB:
+
+| | |
+|---|---|
+| fetch + JSONB parse | **87 ms** |
+| cosine in Python | 32 ms |
+| p95 end to end | **147 ms** |
+
+Three quarters of that is deserialising five hundred rows to keep ten, against a §2 budget of 300ms
+for the whole request. pgvector stores the same vector in a compact binary form, computes the
+distance in the database, and returns the ten — so the cost stops scaling with the catalogue on the
+one read that ranks at request time. At 100 games JSONB was a perfectly acceptable 35ms; the point
+is that it degrades with exactly the growth this service is supposed to survive.
+
+No ANN index on the column, deliberately. HNSW trades exactness for speed at a scale this catalogue
+is nowhere near, and an exact scan of a few hundred binary vectors inside Postgres is already fast.
+It becomes worth adding when the numbers above are measured again and the distance query, rather
+than the transfer, is what costs.
+
+`EMBEDDING_DIMENSIONS` is the price: it is baked into the `vector(n)` column and its migration, so
+pointing at a model of a different width needs a new revision and a re-embedding of the catalogue.
+It is also why `pgvector/pgvector:pg16` replaces the stock Postgres image for the whole platform —
+a drop-in superset, but a shared component changed for one service's benefit.
 
 ---
 
@@ -224,13 +304,24 @@ bug described above.
 
 ## Known limitations
 
-**No TF-IDF.** Features are binary over genres and tags. Inverse document frequency needs a
-corpus-wide pass and, at a few dozen games, mostly amplifies noise. It is an IDF weight on
-`Embedding.of` when the catalogue is large enough to want it.
+**No TF-IDF on the sparse path.** Features there are binary over genres and tags. Inverse document
+frequency needs a corpus-wide pass and, at a few dozen games, mostly amplifies noise. It is an IDF
+weight on `Embedding.of` when the catalogue is large enough to want it — and moot on the dense
+path, which is the other half of what §3.1's "embedding/TF-IDF" offers.
 
 **No matrix factorisation.** Requirements §3.1 says "item-item / MF"; this takes the item-item
 branch. MF means a training step, a model artifact and a serving story that no other service on
 this platform has.
 
-**Genre and tag only.** Browsing behaviour is listed as an input in §3.1 and no service currently
-emits it. When one does, it is another `SignalKind` and a weight.
+**Browsing behaviour is still missing.** It is listed as an input in §3.1 and no service currently
+emits it. When one does, it is another `SignalKind` and a weight — the history now recorded per
+profile means it would also reach the dense vector without further machinery.
+
+**The explanation model is not evaluated.** It is prompted to justify a suggestion only from the
+games a user plays and the candidate's own labels, and any game it names that was not asked about
+is discarded — so a hallucinated id cannot attach one game's reason to another. Nothing checks that
+the sentence it writes is *true* of the game, and nothing can, short of a human reading them.
+
+**A dense re-ranking is not attempted.** The model writes reasons; it does not reorder. That keeps
+the ordering deterministic, reproducible and covered by the end-to-end assertions, and keeps the
+cost at one call per user per sweep. Letting it rank would change all three.

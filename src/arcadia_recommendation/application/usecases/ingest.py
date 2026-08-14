@@ -40,13 +40,14 @@ class HandleGamePublishedUseCase:
         genres: tuple[str, ...],
         tags: tuple[str, ...],
         published_at: datetime | None,
+        description: str = "",
     ) -> None:
         async with self._uow_factory() as uow:
             if await _already_handled(uow, event_id):
                 return
             existing = await uow.games.get(game_id)
             game = (
-                existing.redescribed(title=title, genres=genres, tags=tags)
+                existing.redescribed(title=title, genres=genres, tags=tags, description=description)
                 if existing is not None
                 else GameProfile.published(
                     game_id=game_id,
@@ -54,6 +55,7 @@ class HandleGamePublishedUseCase:
                     title=title,
                     genres=genres,
                     tags=tags,
+                    description=description,
                     published_at=published_at,
                 )
             )

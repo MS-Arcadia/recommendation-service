@@ -17,6 +17,7 @@ dependencies = [
     "sqlalchemy[asyncio]>=2",
     "asyncpg>=0.30",
     "alembic>=1.14",
+    "pgvector>=0.3",
     # The Go services (wallet, payment, marketplace) produce with snappy, and
     # without the codec a consumer raises UnsupportedCodecError on the first
     # message and its loop dies — silently, from the caller's point of view. lz4
@@ -26,13 +27,13 @@ dependencies = [
     "redis>=5",
     "pyjwt>=2.9",
     "prometheus-client>=0.21,<1.0",
+    "httpx>=0.27",
 ]
 
 [dependency-groups]
 dev = [
     "pytest",
     "pytest-asyncio",
-    "httpx",
     "ruff",
     "mypy",
 ]

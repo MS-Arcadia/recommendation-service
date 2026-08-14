@@ -1,5 +1,6 @@
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
+from typing import Protocol
 
 from arcadia_recommendation.domain.catalog.game_profile import GameProfile
 from arcadia_recommendation.domain.preference.profile import UserPreference
@@ -26,15 +27,42 @@ class ScoredGame:
         return RecommendationSource.CONTENT
 
 
+class ContentScorer(Protocol):
+    """What `HybridRanker` needs from the content half, so which vector space it ranks in is a wiring
+    decision rather than a branch in the ranker."""
+
+    def score(self, preference: UserPreference, game: GameProfile) -> float: ...
+
+    def reasons(self, preference: UserPreference, game: GameProfile) -> tuple[str, ...]: ...
+
+
 class ContentBasedScorer:
-    """Requirements §3.1's content half: cosine similarity between the user's taste vector and each game's
-    genre/tag vector. Cheap, and the only half that works for a user nobody else resembles yet."""
+    """Requirements §3.1's content half over genres and tags: cosine similarity between the user's taste
+    vector and each game's. Cheap, explains itself, and the only half that works for a user nobody else
+    resembles yet — but it scores two racing games at zero if they were tagged by different people."""
 
     def score(self, preference: UserPreference, game: GameProfile) -> float:
         return max(0.0, preference.taste.cosine(game.embedding))
 
     def reasons(self, preference: UserPreference, game: GameProfile) -> tuple[str, ...]:
         return preference.taste.overlap(game.embedding)
+
+
+class DenseContentScorer:
+    """Requirements §3.1's content half over embeddings: cosine in the semantic space instead of the
+    genre/tag one.
+
+    It answers what the sparse scorer cannot — similarity between games nobody labelled the same way — and
+    loses what the sparse scorer had. `reasons` is empty here and cannot be otherwise: the dimensions have
+    no names, so nothing in this class knows why two vectors are close. Those come from an explanation model
+    after ranking, which is the price of the space.
+    """
+
+    def score(self, preference: UserPreference, game: GameProfile) -> float:
+        return max(0.0, preference.taste_dense.cosine(game.dense))
+
+    def reasons(self, preference: UserPreference, game: GameProfile) -> tuple[str, ...]:
+        return ()
 
 
 class CollaborativeScorer:
@@ -82,7 +110,7 @@ class HybridRanker:
 
     def __init__(
         self,
-        content: ContentBasedScorer | None = None,
+        content: ContentScorer | None = None,
         collaborative: CollaborativeScorer | None = None,
     ) -> None:
         self._content = content or ContentBasedScorer()

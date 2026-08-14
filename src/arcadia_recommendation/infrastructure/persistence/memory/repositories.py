@@ -36,6 +36,24 @@ class MemoryGameProfileRepository:
         merged = {**self._store.games, **self._staged}
         return sum(1 for game in merged.values() if game.is_published)
 
+    async def needing_embedding(self, limit: int) -> Sequence[GameProfile]:
+        merged = {**self._store.games, **self._staged}
+        pending = [game for game in merged.values() if game.needs_embedding]
+        pending.sort(key=lambda game: (-game.purchase_count, str(game.game_id)))
+        return pending[:limit]
+
+    async def nearest_to(self, game: GameProfile, limit: int) -> Sequence[GameProfile]:
+        if game.dense.is_empty:
+            return []
+        merged = {**self._store.games, **self._staged}
+        scored = [
+            (candidate, game.dense.cosine(candidate.dense))
+            for candidate in merged.values()
+            if candidate.is_published and candidate.game_id != game.game_id and not candidate.dense.is_empty
+        ]
+        scored.sort(key=lambda entry: (-entry[1], str(entry[0].game_id)))
+        return [candidate for candidate, _ in scored[:limit]]
+
 
 class MemoryUserPreferenceRepository:
     def __init__(self, store: MemoryStore, staged: dict[UserId, UserPreference]) -> None:

@@ -12,3 +12,18 @@ MAX_COLLABORATIVE_CANDIDATES: Final = 200
 MAX_FEATURE_CHARS: Final = 64
 
 MAX_TITLE_CHARS: Final = 200
+
+# Catalog's description is the richest input the semantic space has — a paragraph says more about a game
+# than five tags do. Truncated because it is prose from another service and the embedding provider charges
+# by input length, so an unbounded field is somebody else's cost decision.
+MAX_DESCRIPTION_CHARS: Final = 2000
+
+# How many signals a preference profile remembers individually. The vector is a running sum and cannot be
+# rebuilt from itself, so the history is what lets a taste vector be recomputed in a different space when a
+# game's embedding arrives late. Capped because it lives in one JSONB column, and the newest signals are the
+# ones worth keeping when the cap bites.
+MAX_SIGNAL_HISTORY: Final = 200
+
+# How many candidates the explanation model is shown at once. One call per user per sweep, so this is the
+# whole prompt size — and a model asked to justify fifty games at once justifies none of them well.
+MAX_EXPLAINED_CANDIDATES: Final = 10

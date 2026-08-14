@@ -88,3 +88,66 @@ class Embedding:
             if self.weights[name] > 0.0 and other.weights[name] > 0.0
         ]
         return tuple(sorted(shared, key=lambda name: (-self.weights[name], name)))
+
+
+@dataclass(frozen=True, slots=True)
+class DenseEmbedding:
+    """A semantic vector over an anonymous space, as ER د-۱۲'s `vector embedding` column holds it.
+
+    The dimensions have no names, which is the whole difference from `Embedding` and the reason the two
+    coexist rather than one replacing the other. Named features can explain themselves — `overlap` returns
+    the words a suggestion rests on. These cannot: a coordinate is not a reason, so a service ranking in
+    this space has to source its explanations somewhere else. What it buys in exchange is the thing the
+    sparse space cannot do at all — two racing games that share no tag are still neighbours here.
+    """
+
+    values: tuple[float, ...]
+
+    @classmethod
+    def empty(cls) -> DenseEmbedding:
+        return cls(())
+
+    @classmethod
+    def of(cls, values: Iterable[float]) -> DenseEmbedding:
+        return cls(tuple(float(value) for value in values))
+
+    @property
+    def is_empty(self) -> bool:
+        return not self.values
+
+    @property
+    def dimensions(self) -> int:
+        return len(self.values)
+
+    @property
+    def magnitude(self) -> float:
+        return math.sqrt(sum(value * value for value in self.values))
+
+    def plus(self, other: DenseEmbedding, scale: float = 1.0) -> DenseEmbedding:
+        """Accumulates another vector into this one, as the sparse space does.
+
+        An empty vector is the additive identity in either direction rather than an error: a game whose
+        embedding has not been computed yet must not stop a taste vector being folded, and a profile with
+        no signals must accept its first.
+        """
+        if other.is_empty:
+            return self
+        if self.is_empty:
+            return DenseEmbedding(tuple(value * scale for value in other.values))
+        if len(self.values) != len(other.values):
+            raise InvariantViolation(
+                f"cannot add a {other.dimensions}-dimensional vector to a {self.dimensions}-dimensional one"
+            )
+        return DenseEmbedding(tuple(a + b * scale for a, b in zip(self.values, other.values, strict=True)))
+
+    def cosine(self, other: DenseEmbedding) -> float:
+        """Similarity in [-1, 1]. Mismatched dimensions score zero rather than raising: the only way to hold
+        two widths at once is a model change mid-flight, and a ranking that skips the stale half of the
+        catalogue is a better outcome than a sweep that dies on it."""
+        if self.is_empty or other.is_empty or len(self.values) != len(other.values):
+            return 0.0
+        left, right = self.magnitude, other.magnitude
+        if left == 0.0 or right == 0.0:
+            return 0.0
+        dot = sum(a * b for a, b in zip(self.values, other.values, strict=True))
+        return dot / (left * right)

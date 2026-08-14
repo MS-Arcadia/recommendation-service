@@ -22,6 +22,13 @@ class Settings(BaseSettings):
     messaging_backend: Literal["inproc", "kafka"] = "inproc"
     identity_backend: Literal["fake", "jwt"] = "fake"
     cache_backend: Literal["memory", "redis"] = "memory"
+    embedding_backend: Literal["hashing", "huggingface"] = "hashing"
+    explanation_backend: Literal["none", "openai"] = "none"
+
+    # Which space the content half of §3.1 ranks in. `sparse` is genre/tag cosine, explains itself, and is
+    # the default because it needs nothing; `dense` is the semantic one and needs an embedding provider
+    # behind it. Both are always ingested, so this flips either way without a migration or a reingest.
+    scoring_backend: Literal["sparse", "dense"] = "sparse"
 
     jwt_secret: str = "CHANGE_ME_IN_PRODUCTION"  # noqa: S105
     jwt_algorithm: str = "HS256"
@@ -65,6 +72,22 @@ class Settings(BaseSettings):
     generation_batch_size: int = 500
     catalogue_scan_limit: int = 500
 
+    # The stored width of a semantic vector, and the one setting a restart cannot change: it is baked into
+    # the `vector(n)` column, so pointing at a model of a different width needs a migration and a
+    # re-embedding of the catalogue. 1024 matches BAAI/bge-m3 and intfloat/multilingual-e5-large.
+    embedding_dimensions: int = 1024
+    embedding_endpoint: str = ""
+    embedding_api_key: str = ""
+    embedding_batch_size: int = 32
+    embedding_timeout_seconds: float = 30.0
+    embedding_prefix: str = ""
+
+    explanation_base_url: str = ""
+    explanation_api_key: str = ""
+    explanation_model: str = "gpt-4o-mini"
+    explanation_timeout_seconds: float = 30.0
+    explanation_max_tokens: int = 800
+
     recommendation_cache_ttl_seconds: int = 30
     otel_exporter_otlp_endpoint: str | None = None
     otel_console_export: bool = False
@@ -89,6 +112,10 @@ class Settings(BaseSettings):
     def uses_redis(self) -> bool:
         return self.cache_backend == "redis"
 
+    @property
+    def ranks_in_dense_space(self) -> bool:
+        return self.scoring_backend == "dense"
+
     @model_validator(mode="after")
     def _reject_placeholder_secrets(self) -> Self:
         """Refuse to start on a development placeholder outside development.
@@ -106,6 +133,23 @@ class Settings(BaseSettings):
             raise ValueError("JWT_ISSUER and JWT_AUDIENCE are required; every service verifies both")
         if self.uses_postgres and "localhost" in self.database_url:
             raise ValueError("DATABASE_URL still points at localhost")
+        return self
+
+    @model_validator(mode="after")
+    def _reject_unreachable_providers(self) -> Self:
+        """Refuse to start when a third-party backend was selected without an address to reach it at.
+
+        Checked at boot in every environment, not only production, because the failure it prevents is
+        invisible: an embedding backend with no endpoint does not raise on the read path, it just leaves
+        every game unembedded, and a dense ranking over empty vectors returns a plausible-looking list
+        ordered by nothing at all.
+        """
+        if self.embedding_backend == "huggingface" and not self.embedding_endpoint:
+            raise ValueError("EMBEDDING_BACKEND=huggingface requires EMBEDDING_ENDPOINT")
+        if self.explanation_backend == "openai" and not self.explanation_base_url:
+            raise ValueError("EXPLANATION_BACKEND=openai requires EXPLANATION_BASE_URL")
+        if self.embedding_dimensions < 1:
+            raise ValueError("EMBEDDING_DIMENSIONS must be positive")
         return self
 
 

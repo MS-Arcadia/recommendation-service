@@ -24,7 +24,9 @@ class GamePublishedHandler:
 
     Catalog's `_game_payload` carries `genres` and `tags` as lists of strings; both are read defensively
     because this service is a consumer of a contract it does not own, and a malformed one should cost a
-    warning rather than a dead-lettered partition.
+    warning rather than a dead-lettered partition. `description` is read the same way and is optional: it is
+    the richest input the semantic space has, and also the field most likely to be absent, so a game without
+    one is embedded from its title and labels rather than skipped.
     """
 
     def __init__(self, handle: HandleGamePublishedUseCase) -> None:
@@ -48,6 +50,7 @@ class GamePublishedHandler:
             title=title[:200],
             genres=_strings(payload.get("genres")),
             tags=_strings(payload.get("tags")),
+            description=str(payload.get("description") or ""),
             published_at=timestamp_of(payload.get("published_at")),
         )
 

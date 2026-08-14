@@ -75,6 +75,44 @@ class SqlGameProfileRepository:
         )
         return int(total or 0)
 
+    async def needing_embedding(self, limit: int) -> Sequence[GameProfile]:
+        """Published games with no semantic vector yet, most popular first.
+
+        Ordered by popularity for the same reason the candidate scan is: `limit` truncates, and when a
+        backlog exists the games worth spending a provider call on first are the ones people are buying.
+        """
+        statement = (
+            select(GameProfileRow)
+            .where(GameProfileRow.is_published.is_(True), GameProfileRow.dense.is_(None))
+            .order_by(GameProfileRow.purchase_count.desc(), GameProfileRow.game_id)
+            .limit(limit)
+        )
+        rows = (await self._session.execute(statement)).scalars().all()
+        return [game_to_domain(row) for row in rows]
+
+    async def nearest_to(self, game: GameProfile, limit: int) -> Sequence[GameProfile]:
+        """Content neighbours as a distance query, which is what the `vector` column buys.
+
+        The sparse space can only answer this by loading the catalogue and doing the arithmetic in Python.
+        Doing the same over dense vectors was measured at 118ms for 500 games at 1024 dimensions, three
+        quarters of it spent deserialising rows the answer discards; here Postgres orders by cosine distance
+        and returns the ten that survive.
+        """
+        if game.dense.is_empty:
+            return []
+        statement = (
+            select(GameProfileRow)
+            .where(
+                GameProfileRow.is_published.is_(True),
+                GameProfileRow.dense.is_not(None),
+                GameProfileRow.game_id != game.game_id.value,
+            )
+            .order_by(GameProfileRow.dense.cosine_distance(list(game.dense.values)))
+            .limit(limit)
+        )
+        rows = (await self._session.execute(statement)).scalars().all()
+        return [game_to_domain(row) for row in rows]
+
 
 class SqlUserPreferenceRepository:
     def __init__(self, session: AsyncSession) -> None:

@@ -1,4 +1,7 @@
+from dataclasses import dataclass
 from enum import StrEnum
+
+from arcadia_recommendation.domain.shared.ids import GameId
 
 
 class SignalKind(StrEnum):
@@ -26,3 +29,19 @@ _WEIGHTS = {
 
 def weight_of(kind: SignalKind) -> float:
     return _WEIGHTS[kind]
+
+
+@dataclass(frozen=True, slots=True)
+class SignalRecord:
+    """One remembered action — `interaction_history` of ER د-۱۲.
+
+    A taste vector is a running sum, and a sum cannot be taken apart again: once a game has been folded in,
+    nothing recovers which game contributed what. That is fine while there is only one space to fold into,
+    and fatal the moment there are two — a game's semantic embedding is computed by a third party and can
+    arrive minutes after the purchase that should have counted it. Keeping the actions themselves means a
+    taste vector can be rebuilt in any space at any time, so a late embedding costs a recomputation rather
+    than a signal lost for good.
+    """
+
+    game_id: GameId
+    weight: float

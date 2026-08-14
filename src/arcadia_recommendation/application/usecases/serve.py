@@ -80,13 +80,25 @@ class ListSimilarGamesUseCase:
     """Content-based neighbours of one game, with no user involved.
 
     Serves the "more like this" rail on a game page, and it is the only read here that ranks at request
-    time: there is no per-user state to precompute against, the candidate set is one bounded catalogue
-    scan, and cosine over a few dozen sparse vectors is arithmetic rather than a query.
+    time — there is no per-user state to precompute against. The two spaces answer it differently because
+    their vectors cost different amounts to move. Sparse features are a few dozen named weights, so a
+    bounded catalogue scan and cosine in Python is arithmetic rather than a query. Dense vectors are a
+    thousand floats each, and doing the same to them means deserialising five hundred rows to keep ten —
+    so Postgres orders by distance and returns the ten.
+
+    `shared_features` is populated only on the sparse path. Named dimensions can be intersected and
+    anonymous ones cannot, so a dense answer says how alike two games are without claiming to say why.
     """
 
-    def __init__(self, uow_factory: UnitOfWorkFactory, catalogue_limit: int = 500) -> None:
+    def __init__(
+        self,
+        uow_factory: UnitOfWorkFactory,
+        catalogue_limit: int = 500,
+        dense_space: bool = False,
+    ) -> None:
         self._uow_factory = uow_factory
         self._catalogue_limit = catalogue_limit
+        self._dense_space = dense_space
 
     async def execute(
         self, game_id: GameId, limit: int = limits.DEFAULT_RECOMMENDATION_COUNT
@@ -95,6 +107,21 @@ class ListSimilarGamesUseCase:
             subject = await uow.games.get(game_id)
             if subject is None:
                 raise NotFound(f"game {game_id} is not known to this service")
+            if self._dense_space:
+                neighbours = await uow.games.nearest_to(subject, limit)
+                return SimilarGamesResponse(
+                    game_id=str(game_id),
+                    items=[
+                        SimilarGame(
+                            game_id=str(candidate.game_id),
+                            title=candidate.title,
+                            genres=list(candidate.genres),
+                            similarity=round(subject.dense.cosine(candidate.dense), 6),
+                            shared_features=[],
+                        )
+                        for candidate in neighbours
+                    ],
+                )
             candidates = await uow.games.recommendable(self._catalogue_limit)
 
         scored = [

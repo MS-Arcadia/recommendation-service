@@ -5,9 +5,14 @@ from datetime import timedelta
 import redis.asyncio as redis
 from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession, async_sessionmaker
 
+from arcadia_recommendation.application.ports.outbound.enrichment import (
+    EmbeddingPort,
+    ExplanationPort,
+)
 from arcadia_recommendation.application.ports.outbound.messaging import ProcessedEventStore
 from arcadia_recommendation.application.ports.outbound.repositories import UnitOfWork
 from arcadia_recommendation.application.ports.outbound.support import EventStampFactory
+from arcadia_recommendation.application.usecases.enrich import EmbedPendingGamesUseCase
 from arcadia_recommendation.application.usecases.generate import (
     GenerateRecommendationsUseCase,
     RefreshAllRecommendationsUseCase,
@@ -25,8 +30,18 @@ from arcadia_recommendation.application.usecases.serve import (
 from arcadia_recommendation.domain.policy.scoring import (
     CollaborativeScorer,
     ContentBasedScorer,
+    ContentScorer,
+    DenseContentScorer,
     HybridRanker,
     TopSellersProvider,
+)
+from arcadia_recommendation.infrastructure.adapters.embedding import (
+    HashingEmbedder,
+    HuggingFaceEmbedder,
+)
+from arcadia_recommendation.infrastructure.adapters.explanation import (
+    NoExplanations,
+    OpenAiCompatibleExplainer,
 )
 from arcadia_recommendation.infrastructure.adapters.support import SystemClock, UuidGenerator
 from arcadia_recommendation.infrastructure.config.settings import Settings
@@ -148,10 +163,20 @@ def build_container(settings: Settings) -> Container:
     persistence_probe: Probe = PostgresProbe(_require(engine)) if engine is not None else AlwaysReachable()
 
     uow_factory = _unit_of_work_factory(settings, store, sessions)
-    ranker = HybridRanker(ContentBasedScorer(), CollaborativeScorer())
-    generate = GenerateRecommendationsUseCase(uow_factory, ranker, stamps, settings.catalogue_scan_limit)
+    embedder = _embedder(settings)
+    explanations = _explanations(settings)
+    ranker = HybridRanker(_content_scorer(settings), CollaborativeScorer())
+    generate = GenerateRecommendationsUseCase(
+        uow_factory,
+        ranker,
+        stamps,
+        settings.catalogue_scan_limit,
+        explanations,
+        settings.ranks_in_dense_space,
+    )
+    embed_pending = EmbedPendingGamesUseCase(uow_factory, embedder, settings.embedding_batch_size)
     refresh_all = RefreshAllRecommendationsUseCase(
-        uow_factory, generate, stamps, settings.generation_batch_size
+        uow_factory, generate, stamps, settings.generation_batch_size, embed_pending
     )
     scheduler = GenerationScheduler(
         refresh_all,
@@ -167,7 +192,9 @@ def build_container(settings: Settings) -> Container:
 
     use_cases = UseCases(
         serve=ServeRecommendationsUseCase(uow_factory, TopSellersProvider()),
-        similar_games=ListSimilarGamesUseCase(uow_factory, settings.catalogue_scan_limit),
+        similar_games=ListSimilarGamesUseCase(
+            uow_factory, settings.catalogue_scan_limit, settings.ranks_in_dense_space
+        ),
         generate=generate,
         refresh_all=refresh_all,
         handle_game_published=HandleGamePublishedUseCase(uow_factory, stamps),
@@ -252,6 +279,36 @@ def _unit_of_work_factory(
         return MemoryUnitOfWork(memory, topic, current_correlation_id())
 
     return memory_factory
+
+
+def _content_scorer(settings: Settings) -> ContentScorer:
+    if settings.ranks_in_dense_space:
+        return DenseContentScorer()
+    return ContentBasedScorer()
+
+
+def _embedder(settings: Settings) -> EmbeddingPort:
+    if settings.embedding_backend == "huggingface":
+        return HuggingFaceEmbedder(
+            settings.embedding_endpoint,
+            settings.embedding_api_key,
+            settings.embedding_dimensions,
+            settings.embedding_timeout_seconds,
+            settings.embedding_prefix,
+        )
+    return HashingEmbedder(settings.embedding_dimensions)
+
+
+def _explanations(settings: Settings) -> ExplanationPort:
+    if settings.explanation_backend == "openai":
+        return OpenAiCompatibleExplainer(
+            settings.explanation_base_url,
+            settings.explanation_api_key,
+            settings.explanation_model,
+            settings.explanation_timeout_seconds,
+            settings.explanation_max_tokens,
+        )
+    return NoExplanations()
 
 
 def _known_game_provider(uow_factory: Callable[[], UnitOfWork]) -> Callable[[], Awaitable[int]]:
