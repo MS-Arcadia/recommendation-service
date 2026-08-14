@@ -26,7 +26,16 @@ _logger = get_logger(__name__)
 def create_app(container: Container) -> FastAPI:
     """Everything is mounted under /v1, like every other service on the platform, so a gateway routing by path
     prefix and a client generated from several of these OpenAPI documents both behave. Health probes sit
-    outside the version prefix because an orchestrator's probe config should not move when the API does."""
+    outside the version prefix because an orchestrator's probe config should not move when the API does.
+
+    CorrelationIdMiddleware is added last, deliberately: Starlette's add_middleware() prepends, so whichever
+    middleware is registered last ends up outermost — directly under ServerErrorMiddleware, with nothing else
+    between them. It used to sit between RequestLog and PrometheusMetrics, with metrics outer.
+    BaseHTTPMiddleware runs everything inside it in a separate anyio task, and on an exception re-raises it
+    back in the *parent* task rather than the one where it originated — so bind_correlation_id() was invisible
+    by the time register_exception_handlers's catch-all Exception handler (which Starlette pulls out into
+    ServerErrorMiddleware regardless of where it is registered) tried to log with it. Being outermost removes
+    that hop: the id is bound in the same task ServerErrorMiddleware itself runs in."""
     settings = container.settings
     configure_logging(settings)
     configure_tracing(settings)
@@ -44,8 +53,8 @@ def create_app(container: Container) -> FastAPI:
     app.state.metrics = RecommendationMetrics()
 
     app.add_middleware(RequestLogMiddleware)
-    app.add_middleware(CorrelationIdMiddleware)
     app.add_middleware(PrometheusMetricsMiddleware, service=settings.service_name)
+    app.add_middleware(CorrelationIdMiddleware)
 
     app.include_router(health.router)
     app.include_router(recommendations.router, prefix=API_PREFIX)
