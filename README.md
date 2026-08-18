@@ -45,6 +45,75 @@ review-events ──┘                         │
 
 ---
 
+## Use cases
+
+| # | Use case | Actor | Notes |
+|---|---|---|---|
+| 1 | Read own recommendations | Any account | Served from a pre-generated set, never computed in the request |
+| 2 | Read another user's recommendations | Support | Same data, for diagnosing a complaint |
+| 3 | Read games similar to one game | Anyone | Public — the "more like this" rail on a store page |
+| 4 | Refresh everybody's recommendations | Admin / scheduler | The batch |
+| 5 | Refresh one user's | Admin | So a demo does not wait for the batch |
+| 6 | Ingest a taste signal | Kafka consumers | Purchases, reviews, and published games |
+
+## How it talks to the rest of the platform
+
+```mermaid
+graph LR
+    gw["api-gateway"] -->|"REST /recommendations/*"| r["recommendation-service"]
+    ge(("game-events")) --> r
+    pe(("purchase-events")) --> r
+    re(("review-events")) --> r
+    r -->|"reco-events"| ro(("reco-events"))
+    r -->|"embeddings ·<br/>explanations"| llm["LLM / embedding provider<br/><i>OpenAI-compatible</i>"]
+    r --> db[("PostgreSQL + pgvector<br/>arcadia_recommendation")]
+
+    classDef s fill:#2d7dd2,stroke:#1a5a9e,color:#fff
+    classDef t fill:#f5a623,stroke:#c4841c,color:#000
+    classDef e fill:#6b6b6b,stroke:#4d4d4d,color:#fff
+    class gw,r s
+    class ge,pe,re,ro t
+    class llm,db e
+```
+
+| Direction | Peer | Why |
+|---|---|---|
+| Consumes | `game-events` | The catalogue it recommends from — title, genres, tags, description |
+| Consumes | `purchase-events` | The strongest taste signal there is |
+| Consumes | `review-events` | A weaker but signed one — a dislike is information too |
+| Calls out (optional) | an OpenAI-compatible provider | Embeddings for semantic scoring, and a sentence explaining each suggestion |
+| Publishes | `reco-events` | Generation outcomes |
+
+It calls **no sibling service synchronously**. Everything it needs arrives as events, which
+is what lets a recommendation be served while half the platform is restarting.
+
+## Infrastructure
+
+| Concern | Choice |
+|---|---|
+| Language | Python 3.13, FastAPI |
+| Storage | PostgreSQL with **pgvector** — `arcadia_recommendation` |
+| Messaging | Kafka consumer + outbox |
+| Cache | Redis |
+| Port | 8093 |
+| Deployment | 1 replica, HPA to 4 at 70% CPU |
+
+Every backend is a switch, and each flips independently — the service runs fully offline with
+all of them at their defaults:
+
+| Setting | Default | Enabled |
+|---|---|---|
+| `SCORING_BACKEND` | `sparse` | `dense` — vector similarity |
+| `EMBEDDING_BACKEND` | `hashing` | `huggingface` — a real embedding endpoint |
+| `EXPLANATION_BACKEND` | `none` | `openai` — an LLM writes the reason |
+| `PERSISTENCE_BACKEND` | `memory` | `postgres` |
+| `MESSAGING_BACKEND` | `inproc` | `kafka` |
+
+**The PostgreSQL image must carry pgvector.** The migration opens with
+`CREATE EXTENSION IF NOT EXISTS vector`; against a stock `postgres` image it fails, the
+service logs it and carries on starting, and then reports healthy while every query against
+the new columns errors. The platform runs `pgvector/pgvector:pg16` for this reason.
+
 ## How the ranking works
 
 ### Games and users live in the same space — one of two
